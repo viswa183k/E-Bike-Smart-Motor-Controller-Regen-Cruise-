@@ -1,0 +1,158 @@
+// Ebike_Smart_Motor_Controller.ino
+// E-Bike prototype: throttle -> PWM motor control, cruise assist, regen braking measurement
+// Hardware (prototype): Arduino Uno, Hall sensor (speed), throttle pot, brake switch,
+// ACS712 current sensor, MOSFET motor driver (PWM), 16x2 LCD
+
+#include <LiquidCrystal.h>
+
+// LCD pins
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+// Pins
+const int throttlePin = A0;    // throttle potentiometer (0-5V)
+const int currentPin  = A1;    // ACS712 analog output
+const int hallPin     = 2;     // Hall sensor (interrupt)
+const int brakePin    = 7;     // brake switch (digital)
+const int pwmPin      = 9;     // PWM to motor driver
+const int regenEnPin  = 8;     // enable regen circuit (digital output)
+
+// Constants / calibration
+const float Vref = 5.0;
+const float adcToVolt = Vref / 1023.0;
+const float ACS_sensitivity = 0.185; // V/A for ACS712 5A module (example)
+const float ACS_zeroVolt = 2.5;      // sensor mid-point
+const float wheelCircumference = 2.0; // meters (example)
+const int pulsesPerRevolution = 1;    // hall pulses per wheel rev
+
+// Control parameters
+const int maxPWM = 255;
+const float maxSpeedKmh = 60.0;     // for display scaling
+const int cruiseTolerance = 3;      // % tolerance for cruise
+const int cruiseButtonPin = 6;      // simulate a button to toggle cruise
+
+// Runtime variables
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long pulseInterval = 0;
+float speedKmh = 0.0;
+unsigned long lastSpeedCalc = 0;
+bool cruiseEnabled = false;
+int cruiseTargetPWM = 0;
+
+unsigned long lastEnergyTime = 0;
+float energyRecovered_Wh = 0.0; // watt-hours
+float batteryVoltage = 48.0;    // assumed pack voltage for energy calc
+
+void setup() {
+  pinMode(hallPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(hallPin), hallISR, FALLING);
+  pinMode(brakePin, INPUT_PULLUP);
+  pinMode(regenEnPin, OUTPUT);
+  pinMode(cruiseButtonPin, INPUT_PULLUP);
+  pinMode(pwmPin, OUTPUT);
+  digitalWrite(regenEnPin, LOW);
+
+  lcd.begin(16,2);
+  lcd.print("E-bike Controller");
+  delay(1500);
+  lcd.clear();
+
+  lastEnergyTime = millis();
+}
+
+void loop() {
+  // Read throttle and brake
+  int throttleRaw = analogRead(throttlePin);
+  bool brakePressed = (digitalRead(brakePin) == LOW); // active LOW
+  bool cruiseButton = (digitalRead(cruiseButtonPin) == LOW); // toggle
+
+  // Toggle cruise on button press (simple debounce)
+  static bool lastCruiseBtn = HIGH;
+  static unsigned long lastDebounce = 0;
+  if (cruiseButton != lastCruiseBtn && (millis() - lastDebounce) > 200) {
+    if (cruiseButton == LOW) {
+      cruiseEnabled = !cruiseEnabled;
+      if (cruiseEnabled) cruiseTargetPWM = map(throttleRaw, 0, 1023, 0, maxPWM);
+    }
+    lastDebounce = millis();
+  }
+  lastCruiseBtn = cruiseButton;
+
+  // Update speed periodically from hall sensor pulses
+  if (millis() - lastSpeedCalc > 500) {
+    noInterrupts();
+    unsigned long interval = pulseInterval;
+    interrupts();
+    if (interval > 0) {
+      float revPerSec = 1000.0 / (float)interval;
+      float mps = revPerSec * wheelCircumference; // meters per second
+      speedKmh = mps * 3.6;
+      if (speedKmh > maxSpeedKmh) speedKmh = maxSpeedKmh;
+    } else {
+      speedKmh = 0.0;
+    }
+    lastSpeedCalc = millis();
+  }
+
+  int pwmOut = 0;
+  if (brakePressed) {
+    // Regen mode: enable regen circuit and reduce forward PWM
+    digitalWrite(regenEnPin, HIGH);
+    pwmOut = 0; // stop driving forward while regen engaged
+    // measure regenerative current and accumulate energy
+    measureRegenEnergy();
+  } else {
+    digitalWrite(regenEnPin, LOW);
+    if (cruiseEnabled) {
+      // maintain target PWM with small adjustments
+      int currentPWM = analogRead(throttlePin) * maxPWM / 1023;
+      // simple logic: keep PWM near cruiseTargetPWM unless throttle bigger
+      pwmOut = cruiseTargetPWM;
+      // if rider gives throttle > cruise target, increase and update cruise if desired
+      if (currentPWM > cruiseTargetPWM + (cruiseTolerance * maxPWM / 100)) {
+        pwmOut = currentPWM;
+        cruiseTargetPWM = pwmOut; // optionally update cruise setpoint
+      }
+    } else {
+      pwmOut = map(throttleRaw, 0, 1023, 0, maxPWM);
+    }
+  }
+
+  analogWrite(pwmPin, pwmOut);
+
+  // Update LCD
+  lcd.setCursor(0,0);
+  lcd.print("Sp:");
+  lcd.print(speedKmh,1);
+  lcd.print("kmh ");
+
+  lcd.setCursor(0,1);
+  lcd.print("Regen:");
+  lcd.print(energyRecovered_Wh,3);
+  lcd.print("Wh");
+
+  delay(200);
+}
+
+void measureRegenEnergy() {
+  // Read current sensor: voltage -> current. Positive = discharge, negative = charge (regen)
+  int adc = analogRead(currentPin);
+  float v = adc * adcToVolt;
+  float i = (v - ACS_zeroVolt) / ACS_sensitivity; // amps
+  // If i < 0, current flowing back to battery (charging)
+  unsigned long now = millis();
+  float dt = (now - lastEnergyTime) / 1000.0; // seconds
+  lastEnergyTime = now;
+  if (i < -0.1) { // threshold to avoid noise; negative means regen
+    float power = batteryVoltage * (-i); // watts (i negative -> -i positive)
+    energyRecovered_Wh += (power * dt) / 3600.0; // Wh
+  }
+}
+
+// Hall sensor interrupt: measure time between pulses
+void hallISR() {
+  unsigned long t = millis();
+  if (lastPulseTime != 0) {
+    pulseInterval = t - lastPulseTime; // ms per revolution
+  }
+  lastPulseTime = t;
+}
